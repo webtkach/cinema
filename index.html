@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>КАРМАНкино</title>
+<style>
+  html, body { margin: 0; background: #000; }
+</style>
+<!-- React и иконки тянутся с CDN; собственная сборка не нужна -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?deps=react@18.3.1",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1"
+  }
+}
+</script>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- ╔═══════════════════════════════════════════════════════════════╗
+     ║  ЕДИНСТВЕННОЕ, ЧТО НУЖНО ОТРЕДАКТИРОВАТЬ:                      ║
+     ║  вставь сюда адрес своего Cloudflare-воркера (kp-proxy-worker)  ║
+     ║  Например: window.__KP_PROXY__ = "https://kp.xxx.workers.dev"; ║
+     ╚═══════════════════════════════════════════════════════════════╝ -->
+<script>
+  window.__KP_PROXY__ = "https://cinema.web-tkach.workers.dev";
+</script>
+
+<script type="module">
+// site/main.jsx
+import React2 from "react";
+import { createRoot } from "react-dom/client";
+
+// pocket-cinema.jsx
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { Search, SlidersHorizontal, X, Clock, Film, Tv, Star, Play, ExternalLink, ChevronLeft, Trash2, AlertTriangle } from "lucide-react";
+if (typeof window !== "undefined" && !window.storage) {
+  window.storage = {
+    async get(k) {
+      const v = localStorage.getItem(k);
+      return v == null ? null : { key: k, value: v };
+    },
+    async set(k, v) {
+      localStorage.setItem(k, v);
+      return { key: k, value: v };
+    },
+    async delete(k) {
+      localStorage.removeItem(k);
+      return { key: k, deleted: true };
+    },
+    async list(prefix = "") {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(prefix)) keys.push(key);
+      }
+      return { keys, prefix };
+    }
+  };
+}
+var KP = {
+  // Браузер НЕ может ходить в api.kinopoisk.dev напрямую: заголовок X-API-KEY
+  // вызывает CORS-preflight, который сервис не пропускает (отсюда "Failed to fetch").
+  // Решение — прокси из kp-proxy-worker.js: он ходит в API сам, держит токен у себя
+  // и снимает CORS. Токен задаётся в воркере (секрет KP_TOKEN), НЕ здесь.
+  // proxyBase можно задать прямо здесь ИЛИ снаружи через window.__KP_PROXY__
+  // (удобно при хостинге: правишь одну строку в index.html, не трогая бандл).
+  proxyBase: typeof window !== "undefined" && window.__KP_PROXY__ || "",
+  // напр. "https://kp.ВАШ.workers.dev"
+  token: ""
+  // нужен ТОЛЬКО для прямых запросов с сервера; в браузере не сработает
+};
+var API_BASE = `${KP.proxyBase || "https://api.kinopoisk.dev"}/v1.4`;
+var USE_PROXY = Boolean(KP.proxyBase);
+var NEEDS_CONFIG = !USE_PROXY && (!KP.token || KP.token === "\u0412\u0421\u0422\u0410\u0412\u042C_\u0422\u041E\u041A\u0415\u041D");
+var T = {
+  bg: "#0b0b0f",
+  panel: "#15151d",
+  panel2: "#1d1d28",
+  line: "rgba(255,255,255,0.07)",
+  text: "#f4f3f7",
+  sub: "#9a9aab",
+  faint: "#6b6b7a",
+  accent: "#ff5722",
+  accentSoft: "rgba(255,87,34,0.14)",
+  good: "#5ad17a",
+  ok: "#cdb24a"
+};
+async function kpFetch(path, params = {}, signal) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null) url.searchParams.set(k, String(v));
+  }
+  const headers = USE_PROXY ? { accept: "application/json" } : { accept: "application/json", "X-API-KEY": KP.token };
+  const res = await fetch(url.toString(), { headers, signal });
+  if (!res.ok) throw new Error(`KP ${res.status}`);
+  return res.json();
+}
+function hashColors(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = h * 31 + str.charCodeAt(i) >>> 0;
+  const hue = h % 360;
+  return { c1: `hsl(${hue} 26% 30%)`, c2: `hsl(${(hue + 22) % 360} 30% 9%)` };
+}
+var cap = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+var isSeries = (t) => Boolean(t && /series|show/.test(t));
+function mapDoc(d) {
+  const ru = d.name || d.alternativeName || d.enName || "\u0411\u0435\u0437 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F";
+  const orig = d.alternativeName || d.enName || "";
+  const fb = hashColors(orig || ru || String(d.id));
+  const rating = d.rating && (d.rating.kp || d.rating.imdb) || 0;
+  return {
+    id: String(d.id),
+    type: isSeries(d.type) ? "series" : "movie",
+    ru,
+    orig: orig && orig !== ru ? orig : "",
+    year: d.year || null,
+    rating: Math.round(rating * 10) / 10,
+    genres: (d.genres || []).map((g) => cap(g.name)).filter(Boolean),
+    desc: (d.description || d.shortDescription || "").trim(),
+    poster: d.poster && (d.poster.url || d.poster.previewUrl) || null,
+    backdrop: d.backdrop && (d.backdrop.url || d.backdrop.previewUrl) || null,
+    c1: fb.c1,
+    c2: fb.c2
+  };
+}
+async function searchKp(term, signal) {
+  const data = await kpFetch("/movie/search", { query: term, page: 1, limit: 30 }, signal);
+  return (data.docs || []).map(mapDoc);
+}
+async function fetchKpById(id, signal) {
+  const d = await kpFetch(`/movie/${id}`, {}, signal);
+  return mapDoc(d);
+}
+var fmtType = (t) => t === "series" ? "\u0441\u0435\u0440\u0438\u0430\u043B" : "\u0444\u0438\u043B\u044C\u043C";
+var justWatchUrl = (item) => `https://www.justwatch.com/ru/\u043F\u043E\u0438\u0441\u043A?q=${encodeURIComponent(item.ru)}`;
+var kinopoiskUrl = (item) => `https://www.kinopoisk.ru/film/${item.id}/`;
+function Poster({ item, size = "md" }) {
+  const dims = size === "lg" ? { w: 128, h: 188, fz: 13 } : size === "sm" ? { w: 52, h: 76, fz: 10 } : { w: 64, h: 92, fz: 11 };
+  const [err, setErr] = useState(false);
+  const src = item.poster && !err ? item.poster : null;
+  const showImg = Boolean(src);
+  return /* @__PURE__ */ React.createElement("div", { style: {
+    width: dims.w,
+    height: dims.h,
+    borderRadius: 10,
+    flexShrink: 0,
+    background: `linear-gradient(155deg, ${item.c1} 0%, ${item.c2} 100%)`,
+    boxShadow: "0 6px 18px rgba(0,0,0,0.45)",
+    position: "relative",
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "flex-end",
+    padding: 8
+  } }, showImg && /* @__PURE__ */ React.createElement(
+    "img",
+    {
+      src,
+      alt: item.ru,
+      loading: "lazy",
+      onError: () => setErr(true),
+      style: { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }
+    }
+  ), /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", top: 6, right: 6, opacity: 0.85, filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.7))" } }, item.type === "series" ? /* @__PURE__ */ React.createElement(Tv, { size: 14, color: "#fff" }) : /* @__PURE__ */ React.createElement(Film, { size: 14, color: "#fff" })), !showImg && /* @__PURE__ */ React.createElement("div", { style: { fontSize: dims.fz, fontWeight: 700, color: "rgba(255,255,255,0.92)", lineHeight: 1.15, textShadow: "0 1px 4px rgba(0,0,0,0.6)" } }, item.ru));
+}
+function RatingBadge({ r }) {
+  if (!r) return /* @__PURE__ */ React.createElement("span", { style: { color: T.faint, fontWeight: 800, fontSize: 14 } }, "\u2014");
+  const color = r >= 8 ? T.good : r >= 7 ? T.ok : T.faint;
+  return /* @__PURE__ */ React.createElement("span", { style: { color, fontWeight: 800, fontSize: 14 } }, r.toFixed(1));
+}
+function ResultRow({ item, onOpen }) {
+  return /* @__PURE__ */ React.createElement("button", { onClick: () => onOpen(item), style: {
+    display: "flex",
+    gap: 14,
+    alignItems: "center",
+    width: "100%",
+    textAlign: "left",
+    background: "transparent",
+    border: "none",
+    padding: "12px 4px",
+    cursor: "pointer"
+  } }, /* @__PURE__ */ React.createElement(Poster, { item }), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { color: T.text, fontWeight: 700, fontSize: 17, marginBottom: 4, fontFamily: "'Unbounded', sans-serif" } }, item.ru), /* @__PURE__ */ React.createElement("div", { style: { color: T.sub, fontSize: 14, display: "flex", gap: 7, alignItems: "baseline", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(RatingBadge, { r: item.rating }), /* @__PURE__ */ React.createElement("span", { style: { color: T.faint } }, item.orig ? `${item.orig}, ` : "", fmtType(item.type), item.year ? `, ${item.year}` : ""))), /* @__PURE__ */ React.createElement("div", { style: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: T.accent,
+    color: "#fff",
+    padding: "9px 14px",
+    borderRadius: 10,
+    fontWeight: 700,
+    fontSize: 14,
+    flexShrink: 0
+  } }, /* @__PURE__ */ React.createElement(Play, { size: 14, fill: "#fff" }), " \u041E\u0442\u043A\u0440\u044B\u0442\u044C"));
+}
+function Detail({ item, onClose, onWatched }) {
+  const [data, setData] = useState(item);
+  const [bgErr, setBgErr] = useState(false);
+  useEffect(() => {
+    setData(item);
+    setBgErr(false);
+    if (item.desc && item.genres.length) return;
+    const ctrl = new AbortController();
+    fetchKpById(item.id, ctrl.signal).then((full) => setData((cur) => cur.id === item.id ? { ...cur, ...full } : cur)).catch(() => {
+    });
+    return () => ctrl.abort();
+  }, [item]);
+  const open = (url) => {
+    onWatched(data);
+    window.open(url, "_blank", "noopener");
+  };
+  const bgSrc = data.backdrop && !bgErr ? data.backdrop : null;
+  return /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", inset: 0, background: T.bg, zIndex: 30, display: "flex", flexDirection: "column", animation: "slideUp .25s ease" } }, /* @__PURE__ */ React.createElement("div", { style: { height: 200, background: `linear-gradient(155deg, ${data.c1}, ${data.c2})`, position: "relative", overflow: "hidden" } }, bgSrc && /* @__PURE__ */ React.createElement("img", { src: bgSrc, alt: "", onError: () => setBgErr(true), style: { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" } }), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { position: "absolute", top: 16, left: 16, background: "rgba(0,0,0,0.4)", border: "none", borderRadius: 999, width: 38, height: 38, display: "grid", placeItems: "center", cursor: "pointer", zIndex: 2 } }, /* @__PURE__ */ React.createElement(ChevronLeft, { size: 22, color: "#fff" })), /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", inset: 0, background: `linear-gradient(to top, ${T.bg} 4%, transparent 60%)` } })), /* @__PURE__ */ React.createElement("div", { style: { padding: "0 22px 22px", marginTop: -70, position: "relative", overflowY: "auto" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 16, alignItems: "flex-end" } }, /* @__PURE__ */ React.createElement(Poster, { item: data, size: "lg" }), /* @__PURE__ */ React.createElement("div", { style: { paddingBottom: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(Star, { size: 16, fill: T.good, color: T.good }), /* @__PURE__ */ React.createElement(RatingBadge, { r: data.rating })), /* @__PURE__ */ React.createElement("div", { style: { color: T.sub, fontSize: 14, marginTop: 4 } }, fmtType(data.type), data.year ? `, ${data.year}` : ""))), /* @__PURE__ */ React.createElement("h2", { style: { color: T.text, fontFamily: "'Unbounded', sans-serif", fontSize: 24, fontWeight: 700, margin: "18px 0 2px", lineHeight: 1.15 } }, data.ru), data.orig && /* @__PURE__ */ React.createElement("div", { style: { color: T.faint, fontSize: 14 } }, data.orig), data.genres.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", margin: "14px 0" } }, data.genres.map((g) => /* @__PURE__ */ React.createElement("span", { key: g, style: { background: T.panel2, color: T.sub, fontSize: 13, padding: "6px 12px", borderRadius: 999 } }, g))), /* @__PURE__ */ React.createElement("p", { style: { color: T.sub, fontSize: 15, lineHeight: 1.5, margin: "8px 0 22px" } }, data.desc || "\u041E\u043F\u0438\u0441\u0430\u043D\u0438\u0435 \u043F\u043E\u043A\u0430 \u043D\u0435 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D\u043E."), /* @__PURE__ */ React.createElement("button", { onClick: () => open(justWatchUrl(data)), style: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    background: T.accent,
+    color: "#fff",
+    border: "none",
+    padding: "16px",
+    borderRadius: 14,
+    fontWeight: 800,
+    fontSize: 16,
+    cursor: "pointer",
+    marginBottom: 10
+  } }, /* @__PURE__ */ React.createElement(Play, { size: 18, fill: "#fff" }), " \u0413\u0434\u0435 \u0441\u043C\u043E\u0442\u0440\u0435\u0442\u044C \u043B\u0435\u0433\u0430\u043B\u044C\u043D\u043E"), /* @__PURE__ */ React.createElement("button", { onClick: () => open(kinopoiskUrl(data)), style: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    background: T.panel2,
+    color: T.text,
+    border: `1px solid ${T.line}`,
+    padding: "15px",
+    borderRadius: 14,
+    fontWeight: 700,
+    fontSize: 15,
+    cursor: "pointer"
+  } }, /* @__PURE__ */ React.createElement(ExternalLink, { size: 16 }), " \u041E\u0442\u043A\u0440\u044B\u0442\u044C \u043D\u0430 \u041A\u0438\u043D\u043E\u043F\u043E\u0438\u0441\u043A\u0435"), /* @__PURE__ */ React.createElement("p", { style: { color: T.faint, fontSize: 12, lineHeight: 1.45, marginTop: 16, textAlign: "center" } }, "\u0414\u0430\u043D\u043D\u044B\u0435 \u043F\u0440\u0435\u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u044B kinopoisk.dev. \u041A\u043D\u043E\u043F\u043A\u0438 \u0432\u0435\u0434\u0443\u0442 \u043A \u043B\u0435\u0433\u0430\u043B\u044C\u043D\u044B\u043C \u043F\u043B\u043E\u0449\u0430\u0434\u043A\u0430\u043C, \u0433\u0434\u0435 \u044D\u0442\u043E\u0442 \u043F\u0440\u043E\u0435\u043A\u0442 \u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u043A \u043F\u0440\u043E\u0441\u043C\u043E\u0442\u0440\u0443.")));
+}
+function SectionLabel({ children }) {
+  return /* @__PURE__ */ React.createElement("div", { style: { color: T.faint, fontSize: 13, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, margin: "14px 4px 4px" } }, children);
+}
+function Spinner() {
+  return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", placeItems: "center", padding: "70px 0", animation: "fadeIn .2s" } }, /* @__PURE__ */ React.createElement("div", { style: { width: 34, height: 34, borderRadius: "50%", border: `3px solid ${T.panel2}`, borderTopColor: T.accent, animation: "pcSpin .8s linear infinite" } }));
+}
+function Empty({ icon, title, text }) {
+  return /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", padding: "60px 24px", animation: "fadeIn .3s" } }, /* @__PURE__ */ React.createElement("div", { style: { width: 64, height: 64, borderRadius: 18, background: T.panel, display: "grid", placeItems: "center", margin: "0 auto 16px" } }, icon), /* @__PURE__ */ React.createElement("div", { style: { color: T.text, fontWeight: 700, fontSize: 17, marginBottom: 6, fontFamily: "'Unbounded', sans-serif" } }, title), /* @__PURE__ */ React.createElement("div", { style: { color: T.faint, fontSize: 14, lineHeight: 1.45 } }, text));
+}
+function PocketCinema() {
+  const [tab, setTab] = useState("search");
+  const [q, setQ] = useState("");
+  const [active, setActive] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [filterType, setFilterType] = useState("all");
+  const [showFilter, setShowFilter] = useState(false);
+  const [raw, setRaw] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const storageOk = useRef(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get("pc_history");
+        if (r && r.value) setHistory(JSON.parse(r.value));
+        storageOk.current = true;
+      } catch {
+        storageOk.current = false;
+      }
+    })();
+  }, []);
+  const persist = async (next) => {
+    setHistory(next);
+    if (storageOk.current) {
+      try {
+        await window.storage.set("pc_history", JSON.stringify(next));
+      } catch {
+      }
+    }
+  };
+  const addToHistory = (item) => {
+    const entry = { ...item, ts: Date.now() };
+    persist([entry, ...history.filter((h) => h.id !== item.id)].slice(0, 30));
+  };
+  const clearHistory = () => persist([]);
+  useEffect(() => {
+    const term = q.trim();
+    if (!term) {
+      setRaw([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    if (NEEDS_CONFIG) {
+      setError("no_config");
+      setRaw([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    const ctrl = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const items = await searchKp(term, ctrl.signal);
+        setRaw(items);
+      } catch (e) {
+        if (e.name !== "AbortError") setError(e.message || "\u041E\u0448\u0438\u0431\u043A\u0430 \u0437\u0430\u043F\u0440\u043E\u0441\u0430");
+      } finally {
+        setLoading(false);
+      }
+    }, 350);
+    return () => {
+      clearTimeout(timer);
+      ctrl.abort();
+    };
+  }, [q]);
+  const results = useMemo(
+    () => filterType === "all" ? raw : raw.filter((i) => i.type === filterType),
+    [raw, filterType]
+  );
+  const openItem = useCallback((item) => setActive(item), []);
+  return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", placeItems: "center", background: "#000", minHeight: "100vh", padding: 16, fontFamily: "'Manrope', sans-serif" } }, /* @__PURE__ */ React.createElement("style", null, `
+        @import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+        *{box-sizing:border-box} ::-webkit-scrollbar{width:0}
+        @keyframes slideUp{from{transform:translateY(18px);opacity:0}to{transform:translateY(0);opacity:1}}
+        @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+        @keyframes pcSpin{to{transform:rotate(360deg)}}
+        input::placeholder{color:${T.faint}}
+      `), /* @__PURE__ */ React.createElement("div", { style: {
+    width: 390,
+    height: 800,
+    background: T.bg,
+    borderRadius: 38,
+    overflow: "hidden",
+    position: "relative",
+    boxShadow: "0 30px 90px rgba(0,0,0,0.6)",
+    border: "1px solid rgba(255,255,255,0.06)",
+    display: "flex",
+    flexDirection: "column"
+  } }, /* @__PURE__ */ React.createElement("div", { style: { padding: "20px 18px 8px", flexShrink: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 16, paddingLeft: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { fontFamily: "'Unbounded', sans-serif", fontWeight: 700, fontSize: 22, color: T.text } }, "\u041A\u0410\u0420\u041C\u0410\u041D"), /* @__PURE__ */ React.createElement("span", { style: { color: T.accent, fontFamily: "'Unbounded', sans-serif", fontWeight: 700, fontSize: 22 } }, "\u043A\u0438\u043D\u043E")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, background: T.panel, borderRadius: 14, padding: "0 14px", height: 50, border: `1px solid ${T.line}` } }, /* @__PURE__ */ React.createElement(Search, { size: 20, color: T.faint }), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: q,
+      onChange: (e) => {
+        setQ(e.target.value);
+        setTab("search");
+      },
+      placeholder: "\u0424\u0438\u043B\u044C\u043C \u0438\u043B\u0438 \u0441\u0435\u0440\u0438\u0430\u043B\u2026",
+      style: { flex: 1, background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 16, fontWeight: 500, fontFamily: "'Manrope', sans-serif" }
+    }
+  ), q ? /* @__PURE__ */ React.createElement("button", { onClick: () => setQ(""), style: { background: "none", border: "none", cursor: "pointer", display: "grid" } }, /* @__PURE__ */ React.createElement(X, { size: 18, color: T.faint })) : /* @__PURE__ */ React.createElement("button", { onClick: () => setShowFilter((s) => !s), style: { background: "none", border: "none", cursor: "pointer", display: "grid" } }, /* @__PURE__ */ React.createElement(SlidersHorizontal, { size: 20, color: showFilter ? T.accent : T.faint }))), showFilter && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 12, animation: "fadeIn .2s" } }, [["all", "\u0412\u0441\u0435"], ["movie", "\u0424\u0438\u043B\u044C\u043C\u044B"], ["series", "\u0421\u0435\u0440\u0438\u0430\u043B\u044B"]].map(([v, l]) => /* @__PURE__ */ React.createElement("button", { key: v, onClick: () => setFilterType(v), style: {
+    flex: 1,
+    padding: "9px",
+    borderRadius: 10,
+    border: "none",
+    cursor: "pointer",
+    fontWeight: 700,
+    fontSize: 13,
+    background: filterType === v ? T.accent : T.panel2,
+    color: filterType === v ? "#fff" : T.sub
+  } }, l))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, background: T.panel, borderRadius: 12, padding: 4, marginTop: 14 } }, [["search", "\u041F\u043E\u0438\u0441\u043A", null], ["history", "\u0418\u0441\u0442\u043E\u0440\u0438\u044F", history.length]].map(([v, l, n]) => /* @__PURE__ */ React.createElement("button", { key: v, onClick: () => setTab(v), style: {
+    flex: 1,
+    padding: "10px",
+    borderRadius: 9,
+    border: "none",
+    cursor: "pointer",
+    fontWeight: 700,
+    fontSize: 14,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    background: tab === v ? T.panel2 : "transparent",
+    color: tab === v ? T.text : T.faint
+  } }, v === "history" && /* @__PURE__ */ React.createElement(Clock, { size: 15 }), l, n ? /* @__PURE__ */ React.createElement("span", { style: { background: T.accentSoft, color: T.accent, borderRadius: 999, fontSize: 11, padding: "1px 7px", fontWeight: 800 } }, n) : null)))), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, overflowY: "auto", padding: "6px 18px 24px" } }, tab === "search" && (q.trim() === "" ? /* @__PURE__ */ React.createElement(Empty, { icon: /* @__PURE__ */ React.createElement(Search, { size: 30, color: T.faint }), title: "\u041D\u0430\u0447\u043D\u0438\u0442\u0435 \u0432\u0432\u043E\u0434\u0438\u0442\u044C \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435", text: "\u041F\u043E\u0438\u0441\u043A \u043F\u043E \u0444\u0438\u043B\u044C\u043C\u0430\u043C \u0438 \u0441\u0435\u0440\u0438\u0430\u043B\u0430\u043C \u0438\u0437 \u0431\u0430\u0437\u044B kinopoisk.dev." }) : loading ? /* @__PURE__ */ React.createElement(Spinner, null) : error === "no_config" ? /* @__PURE__ */ React.createElement(Empty, { icon: /* @__PURE__ */ React.createElement(AlertTriangle, { size: 30, color: T.ok }), title: "\u041D\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D \u0434\u043E\u0441\u0442\u0443\u043F", text: "\u0417\u0430\u0434\u0430\u0439\u0442\u0435 proxyBase (\u0430\u0434\u0440\u0435\u0441 \u0432\u043E\u0440\u043A\u0435\u0440\u0430) \u0432 \u0431\u043B\u043E\u043A\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043A KP \u0432 \u043D\u0430\u0447\u0430\u043B\u0435 \u0444\u0430\u0439\u043B\u0430." }) : error ? /* @__PURE__ */ React.createElement(Empty, { icon: /* @__PURE__ */ React.createElement(AlertTriangle, { size: 30, color: T.accent }), title: "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044C", text: `kinopoisk.dev: ${error}. \u0415\u0441\u043B\u0438 \u044D\u0442\u043E \xABFailed to fetch\xBB \u2014 \u043D\u0443\u0436\u0435\u043D \u043F\u0440\u043E\u043A\u0441\u0438 (kp-proxy-worker.js): \u0431\u0440\u0430\u0443\u0437\u0435\u0440 \u043D\u0435 \u0445\u043E\u0434\u0438\u0442 \u0432 API \u043D\u0430\u043F\u0440\u044F\u043C\u0443\u044E.` }) : results.length === 0 ? /* @__PURE__ */ React.createElement(Empty, { icon: /* @__PURE__ */ React.createElement(Film, { size: 30, color: T.faint }), title: "\u041D\u0438\u0447\u0435\u0433\u043E \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E", text: `\u041F\u043E \u0437\u0430\u043F\u0440\u043E\u0441\u0443 \xAB${q}\xBB \u0441\u043E\u0432\u043F\u0430\u0434\u0435\u043D\u0438\u0439 \u043D\u0435\u0442.` }) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(SectionLabel, null, "\u0424\u0438\u043B\u044C\u043C\u044B \u0438 \u0441\u0435\u0440\u0438\u0430\u043B\u044B"), results.map((item) => /* @__PURE__ */ React.createElement(ResultRow, { key: item.id, item, onOpen: openItem })))), tab === "history" && (history.length === 0 ? /* @__PURE__ */ React.createElement(Empty, { icon: /* @__PURE__ */ React.createElement(Clock, { size: 30, color: T.faint }), title: "\u0418\u0441\u0442\u043E\u0440\u0438\u044F \u043F\u0443\u0441\u0442\u0430", text: "\u041E\u0442\u043A\u0440\u044B\u0442\u044B\u0435 \u043F\u0440\u043E\u0435\u043A\u0442\u044B \u043F\u043E\u044F\u0432\u044F\u0442\u0441\u044F \u0437\u0434\u0435\u0441\u044C \u0434\u043B\u044F \u0431\u044B\u0441\u0442\u0440\u043E\u0433\u043E \u0432\u043E\u0437\u0432\u0440\u0430\u0442\u0430." }) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } }, /* @__PURE__ */ React.createElement(SectionLabel, null, "\u041D\u0435\u0434\u0430\u0432\u043D\u043E \u043E\u0442\u043A\u0440\u044B\u0442\u044B\u0435"), /* @__PURE__ */ React.createElement("button", { onClick: clearHistory, style: { background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 5, color: T.faint, fontSize: 12, fontWeight: 600 } }, /* @__PURE__ */ React.createElement(Trash2, { size: 13 }), " \u041E\u0447\u0438\u0441\u0442\u0438\u0442\u044C")), history.map((item) => /* @__PURE__ */ React.createElement(ResultRow, { key: item.id, item, onOpen: openItem }))))), active && /* @__PURE__ */ React.createElement(Detail, { item: active, onClose: () => setActive(null), onWatched: addToHistory })));
+}
+
+// site/main.jsx
+createRoot(document.getElementById("root")).render(React2.createElement(PocketCinema));
+
+</script>
+</body>
+</html>
