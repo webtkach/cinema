@@ -132,9 +132,25 @@ function mapDoc(d) {
     c2: fb.c2
   };
 }
+function norm(s) {
+  return (s || "").toLowerCase().replace(/ё/g, "\u0435").replace(/[^a-zа-я0-9]+/g, " ").trim();
+}
+function relevance(item, tokens, phrase) {
+  const hay = norm(`${item.ru} ${item.orig || ""}`);
+  if (!tokens.every((t) => hay.includes(t))) return -1;
+  let score = item.rating || 0;
+  if (hay === phrase) score += 100;
+  else if (hay.startsWith(phrase)) score += 50;
+  else if (hay.includes(phrase)) score += 25;
+  return score;
+}
 async function searchKp(term, signal) {
-  const data = await kpFetch("/movie/search", { query: term, page: 1, limit: 30 }, signal);
-  return (data.docs || []).map(mapDoc);
+  const data = await kpFetch("/movie/search", { query: term, page: 1, limit: 50 }, signal);
+  const items = (data.docs || []).map(mapDoc);
+  const phrase = norm(term);
+  const tokens = phrase.split(" ").filter(Boolean);
+  if (!tokens.length) return items;
+  return items.map((it) => ({ it, score: relevance(it, tokens, phrase) })).filter((x) => x.score >= 0).sort((a, b) => b.score - a.score).map((x) => x.it);
 }
 async function fetchKpById(id, signal) {
   const d = await kpFetch(`/movie/${id}`, {}, signal);
